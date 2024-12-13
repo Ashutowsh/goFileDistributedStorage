@@ -2,132 +2,131 @@ package transport
 
 import (
 	"errors"
-	"fmt"
 	"log"
 	"net"
 	"sync"
 )
 
-// TCPPeer represents a peer in the TCP network.
-type TCPPeer struct {
-	Conn     net.Conn
-	outbound bool
-	wg       *sync.WaitGroup
-}
-
-func NewTCPPeer(conn net.Conn, outbound bool) *TCPPeer {
-	return &TCPPeer{
-		Conn:     conn,
-		outbound: outbound,
-		wg:       &sync.WaitGroup{},
-	}
-}
-
-func (p *TCPPeer) CloseStream() {
-	p.wg.Done()
-}
-
-func (p *TCPPeer) Send(b []byte) error {
-	_, err := p.Conn.Write(b)
-	return err
-}
-
+// TCPTransport implements the Transport interface for TCP communication.
 type TCPTransport struct {
-	TransportOpts
+	opts     TransportOpts
 	listener net.Listener
-	rpcch    chan RPC
+	rpcCh    chan RPC
 }
 
+// NewTCPTransport creates a new instance of TCPTransport.
 func NewTCPTransport(opts TransportOpts) *TCPTransport {
 	return &TCPTransport{
-		TransportOpts: opts,
-		rpcch:         make(chan RPC, 1024),
+		opts:  opts,
+		rpcCh: make(chan RPC, 1024),
 	}
 }
 
-func (t *TCPTransport) Addr() string {
-	return t.ListenAddr
-}
-
-func (t *TCPTransport) Consume() <-chan RPC {
-	return t.rpcch
-}
-
-func (t *TCPTransport) Close() error {
-	return t.listener.Close()
-}
-
+// Dial connects to a remote address via TCP.
 func (t *TCPTransport) Dial(addr string) error {
 	conn, err := net.Dial("tcp", addr)
 	if err != nil {
 		return err
 	}
-
-	go t.handleConn(conn, true)
+	go t.handleConnection(conn, true)
 	return nil
 }
 
+// ListenAndAccept starts the TCP listener and accepts incoming connections.
 func (t *TCPTransport) ListenAndAccept() error {
-	var err error
-	t.listener, err = net.Listen("tcp", t.ListenAddr)
+	listener, err := net.Listen("tcp", t.opts.ListenAddr)
 	if err != nil {
 		return err
 	}
-
-	go t.startAcceptLoop()
-	log.Printf("TCP transport listening on port: %s\n", t.ListenAddr)
+	t.listener = listener
+	log.Printf("Listening on %s", t.opts.ListenAddr)
+	go t.acceptConnections()
 	return nil
 }
 
-func (t *TCPTransport) startAcceptLoop() {
+// Close stops the transport and closes the listener.
+func (t *TCPTransport) Close() error {
+	if t.listener != nil {
+		return t.listener.Close()
+	}
+	return nil
+}
+
+// Consume returns the channel for incoming RPC messages.
+func (t *TCPTransport) Consume() <-chan RPC {
+	return t.rpcCh
+}
+
+// Addr returns the listening address of the transport.
+func (t *TCPTransport) Addr() string {
+	return t.opts.ListenAddr
+}
+
+func (t *TCPTransport) acceptConnections() {
 	for {
 		conn, err := t.listener.Accept()
 		if errors.Is(err, net.ErrClosed) {
 			return
 		}
-
 		if err != nil {
-			fmt.Printf("TCP accept error: %s\n", err)
+			log.Printf("Error accepting connection: %s", err)
+			continue
 		}
-
-		go t.handleConn(conn, false)
+		go t.handleConnection(conn, false)
 	}
 }
 
-func (t *TCPTransport) handleConn(conn net.Conn, outbound bool) {
-	var err error
-	defer func() {
-		conn.Close()
-	}()
+func (t *TCPTransport) handleConnection(conn net.Conn, outbound bool) {
+	defer conn.Close()
 
 	peer := NewTCPPeer(conn, outbound)
-
-	if err = t.HandshakeFunc(peer); err != nil {
-		return
-	}
-
-	if t.OnPeer != nil {
-		if err = t.OnPeer(peer); err != nil {
+	if t.opts.HandshakeFunc != nil {
+		if err := t.opts.HandshakeFunc(peer); err != nil {
+			log.Printf("Handshake failed: %s", err)
 			return
 		}
 	}
 
-	// Read loop
+	if t.opts.OnPeer != nil {
+		if err := t.opts.OnPeer(peer); err != nil {
+			log.Printf("Peer rejected: %s", err)
+			return
+		}
+	}
+
 	for {
 		rpc := RPC{}
-		err = t.Decoder.Decode(conn, &rpc)
-		if err != nil {
+		if err := t.opts.Decoder.Decode(conn, &rpc); err != nil {
+			log.Printf("Error decoding message: %s", err)
 			return
 		}
-
 		rpc.From = conn.RemoteAddr().String()
-
-		if rpc.Stream {
-			peer.wg.Add(1)
-			peer.wg.Wait()
-			continue
-		}
-
-		t.rpcch <- rpc
+		t.rpcCh <- rpc
 	}
+}
+
+// TCPPeer implements the Peer interface for TCP connections.
+type TCPPeer struct {
+	conn     net.Conn
+	outbound bool
+	wg       sync.WaitGroup
+}
+
+// NewTCPPeer creates a new TCPPeer instance.
+func NewTCPPeer(conn net.Conn, outbound bool) *TCPPeer {
+	return &TCPPeer{
+		conn:     conn,
+		outbound: outbound,
+	}
+}
+
+// Send writes data to the peer's connection.
+func (p *TCPPeer) Send(data []byte) error {
+	_, err := p.conn.Write(data)
+	return err
+}
+
+// CloseStream marks the stream as completed.
+func (p *TCPPeer) CloseStream() {
+	p.wg.Done()
 }
